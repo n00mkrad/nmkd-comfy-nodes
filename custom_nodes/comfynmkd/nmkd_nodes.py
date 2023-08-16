@@ -448,7 +448,7 @@ class NmkdColorPreprocessor:
         return {"required": {
         "image": ("IMAGE",),
         "divisor": ("INT", {"default": 64, "min": 8, "max": 128, "step": 8}),
-    }}
+        }}
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "get_palette"
 
@@ -462,6 +462,26 @@ class NmkdColorPreprocessor:
         img = img.resize((w, h), Image.NEAREST)
         img = image_to_tensor(img)
         return (img,)
+
+
+# Encode two texts with CLIP (for pos/neg prompts, etc)
+class NmkdDualTextEncode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+        "text1": ("STRING", {"multiline": False}),
+        "text2": ("STRING", {"multiline": False}),
+        "clip": ("CLIP", )
+        }}
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING",)
+    FUNCTION = "encode"
+
+    CATEGORY = "Nmkd/Conditioning"
+
+    def encode(self, clip, text1, text2):
+        cond1, pooled1 = clip.encode_from_tokens(clip.tokenize(text1), return_pooled=True)
+        cond2, pooled2 = clip.encode_from_tokens(clip.tokenize(text2), return_pooled=True)
+        return ([[cond1, {"pooled_output": pooled1}]], [[cond2, {"pooled_output": pooled2}]])
 
 
 # Register nodes
@@ -480,6 +500,7 @@ NODE_CLASS_MAPPINGS = {
     "NmkdControlNet": NmkdControlNet,
     "NmkdHypernetworkLoader": NmkdHypernetworkLoader,
     "NmkdColorPreprocessor": NmkdColorPreprocessor,
+    "NmkdDualTextEncode": NmkdDualTextEncode,
 }
 
 def tensor_to_image(tensor):
