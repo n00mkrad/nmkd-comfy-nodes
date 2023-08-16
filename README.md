@@ -41,6 +41,7 @@ ComfyUI custom nodes, primarily optimized for usage with API, not GUI
 - `NmkdControlNet`: Combines ControlNet Load+Apply nodes, and accepts abs. paths. Can load Diffusers format if an input model is also specified.
 - `NmkdHypernetworkLoader`: Same as original, but accepts absolute paths.
 - `NmkdColorPreprocessor`: Scales down an image 64x, then back up again, intended for use with `t2iadapter_color_sd14v1`
+- `NmkdDualTextEncode`: Like the original `CLIPTextEncode`, but encodes two strings instead of one (e.g. positive and negative prompt).
 
 
 
