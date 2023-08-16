@@ -96,20 +96,25 @@ class NmkdCheckpointLoader:
         print(f"Loading checkpoint: {mdl_path}")
         enable_vae = load_vae == "enable"
         external_vae = enable_vae and vae_path and vae_path is not mdl_path # Only load VAE separately if it has a value and is not identical to the main model
+        diffusers = os.path.isdir(mdl_path)
         if not embeddings_dir:
             embeddings_dir = folder_paths.get_folder_paths("embeddings")
-        out = comfy.sd.load_checkpoint_guess_config(mdl_path, output_vae=(enable_vae and not external_vae), output_clip=True, embedding_directory=embeddings_dir)
-        print(f"MODEL INFO: {os.path.basename(mdl_path)} | {out[0].model.model_type.name} | {out[0].model.model_config.unet_config}")
+        if(diffusers): # Assume path is Diffusers model
+            mdl = comfy.diffusers_load.load_diffusers(mdl_path, fp16=comfy.model_management.should_use_fp16(), output_vae=(enable_vae and not external_vae), output_clip=True, embedding_directory=embeddings_dir)
+        else:
+            mdl = comfy.sd.load_checkpoint_guess_config(mdl_path, output_vae=(enable_vae and not external_vae), output_clip=True, embedding_directory=embeddings_dir)
+        print(f"MODEL INFO: {os.path.basename(mdl_path)} | {mdl[0].model.model_type.name} | {mdl[0].model.model_config.unet_config}")
         if external_vae:
             print(f"Loading external VAE: {vae_path}")
             ext_vae = comfy.sd.VAE(ckpt_path=vae_path)
-            out = (out[0], out[1], ext_vae, out[3])
+            mdl = (mdl[0], mdl[1], ext_vae, mdl[3]) if not diffusers else (mdl[0], mdl[1], ext_vae)
         if clip_skip < -1:
-            clip = out[1]
+            clip = mdl[1]
             clip = clip.clone()
             clip.clip_layer(clip_skip)
             print(f"Applied CLIP skip: Stop at layer {clip_skip}")
-        return out
+        return mdl
+
 
 # KSamplerAdvanced but with denoising control
 class NmkdKSampler:
