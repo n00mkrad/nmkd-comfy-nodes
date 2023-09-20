@@ -3,6 +3,7 @@ import folder_paths
 import comfy.sd
 import latent_preview
 import torch
+import json
 from PIL import Image, ImageOps
 import numpy as np
 import comfy.utils
@@ -14,6 +15,9 @@ import base64
 from io import BytesIO
 import os
 from comfy_extras.nodes_hypernetwork import load_hypernetwork_patch
+from .Fooocus import core
+from .Fooocus import patch
+from PIL.PngImagePlugin import PngInfo
 
 
 # Int Constant
@@ -99,21 +103,25 @@ class NmkdCheckpointLoader:
         diffusers = os.path.isdir(mdl_path)
         if not embeddings_dir:
             embeddings_dir = folder_paths.get_folder_paths("embeddings")
-        if(diffusers): # Assume path is Diffusers model
-            mdl = comfy.diffusers_load.load_diffusers(mdl_path, fp16=comfy.model_management.should_use_fp16(), output_vae=(enable_vae and not external_vae), output_clip=True, embedding_directory=embeddings_dir)
-        else:
-            mdl = comfy.sd.load_checkpoint_guess_config(mdl_path, output_vae=(enable_vae and not external_vae), output_clip=True, embedding_directory=embeddings_dir)
-        print(f"MODEL INFO: {os.path.basename(mdl_path)} | {mdl[0].model.model_type.name} | {mdl[0].model.model_config.unet_config}")
-        if external_vae:
-            print(f"Loading external VAE: {vae_path}")
-            ext_vae = comfy.sd.VAE(ckpt_path=vae_path)
-            mdl = (mdl[0], mdl[1], ext_vae, mdl[3]) if not diffusers else (mdl[0], mdl[1], ext_vae)
-        if clip_skip < -1:
-            clip = mdl[1]
-            clip = clip.clone()
-            clip.clip_layer(clip_skip)
-            print(f"Applied CLIP skip: Stop at layer {clip_skip}")
-        return mdl
+        try:
+            if(diffusers): # Assume path is Diffusers model
+                mdl = comfy.diffusers_load.load_diffusers(mdl_path, fp16=comfy.model_management.should_use_fp16(), output_vae=(enable_vae and not external_vae), output_clip=True, embedding_directory=embeddings_dir)
+            else:
+                mdl = comfy.sd.load_checkpoint_guess_config(mdl_path, output_vae=(enable_vae and not external_vae), output_clip=True, embedding_directory=embeddings_dir)
+            print(f"MODEL INFO: {os.path.basename(mdl_path)} | {mdl[0].model.model_type.name} | {mdl[0].model.model_config.unet_config}{' | Diffusers' if diffusers else ''}")
+            if external_vae:
+                print(f"Loading external VAE: {vae_path}")
+                ext_vae = comfy.sd.VAE(ckpt_path=vae_path)
+                mdl = (mdl[0], mdl[1], ext_vae, mdl[3]) if not diffusers else (mdl[0], mdl[1], ext_vae)
+            if clip_skip < -1:
+                clip = mdl[1]
+                clip = clip.clone()
+                clip.clip_layer(clip_skip)
+                print(f"Applied CLIP skip: Stop at layer {clip_skip}")
+            return mdl
+        except:
+            print(f"Failed to load model: {os.path.basename(mdl_path)}")
+            return None
 
 
 # KSamplerAdvanced but with denoising control
@@ -152,6 +160,49 @@ class NmkdKSampler:
             disable_noise = True
         print(f"Sampling: Steps: {steps} - Start: {start_at_step} - End: {end_at_step} - Add Noise: {add_noise} - Return with noise: {return_with_leftover_noise} - Denoise: {denoise} - Sampler: {sampler_name} - Scheduler: {scheduler}")
         return nodes.common_ksampler(model, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise=denoise, disable_noise=disable_noise, start_step=start_at_step, last_step=end_at_step, force_full_denoise=force_full_denoise)
+
+
+# Sampler with Refiner
+class NmkdHybridSampler:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "model": ("MODEL",),
+                    "refiner_model": ("MODEL",),
+                    "add_noise": (["enable", "disable"], ),
+                    "noise_seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                    "steps": ("INT", {"default": 30, "min": 1, "max": 10000}),
+                    "refiner_switch_step": ("INT", {"default": 20, "min": 1, "max": 10000}),
+                    "cfg": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 100.0}),
+                    "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "dpmpp_2m_sde_gpu", }),
+                    "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "karras", }),
+                    "positive": ("CONDITIONING", ),
+                    "negative": ("CONDITIONING", ),
+                    "refiner_positive": ("CONDITIONING", ),
+                    "refiner_negative": ("CONDITIONING", ),
+                    "latent_image": ("LATENT", ),
+                    "start_at_step": ("INT", {"default": 0, "min": 0, "max": 10000}),
+                    "end_at_step": ("INT", {"default": 10000, "min": 0, "max": 10000}),
+                    "return_with_leftover_noise": (["disable", "enable"], ),
+                    "sharpness": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0}),
+                    "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0}),
+                }}
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "sample"
+
+    CATEGORY = "Nmkd/Sampling"
+
+    def sample(self, model, refiner_model, add_noise, noise_seed, steps, refiner_switch_step, cfg, sampler_name, scheduler, positive, negative, refiner_positive, refiner_negative, latent_image, start_at_step, end_at_step, return_with_leftover_noise, sharpness, denoise):
+        force_full_denoise = True
+        if return_with_leftover_noise == "enable":
+            force_full_denoise = False
+        disable_noise = False
+        if add_noise == "disable":
+            disable_noise = True
+        patch.sharpness = sharpness
+        print(f"Sampling: Steps: {steps} - Switch at: {refiner_switch_step} - Add Noise: {add_noise} - Return with noise: {return_with_leftover_noise} - Denoise: {denoise} - Sampler: {sampler_name} - Scheduler: {scheduler}")
+        return (core.ksampler_with_refiner(model, positive, negative, refiner_model, refiner_positive, refiner_negative, latent_image, noise_seed, steps, refiner_switch_step, cfg, sampler_name, scheduler, denoise=denoise, disable_noise=disable_noise, start_step=start_at_step, last_step=end_at_step, force_full_denoise=force_full_denoise), )
 
 
 # Image loader that accepts an absolute path
@@ -227,6 +278,22 @@ class NmkdImageUpscale:
         except:
             print("NmkdImageUpscale: Upscaling failed! Returning original image.")
             return (image,)
+
+
+# Upscale model loader that accepts an absolute path
+class NmkdUpscaleModelLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { "model_path": ("STRING", {"multiline": False} ), }}
+    RETURN_TYPES = ("UPSCALE_MODEL",)
+    FUNCTION = "load_model"
+
+    CATEGORY = "Nmkd/Loaders"
+
+    def load_model(self, model_path):
+        sd = comfy.utils.load_torch_file(model_path, safe_load=True)
+        out = model_loading.load_state_dict(sd).eval()
+        return (out, )
 
 
 # LoRA loader that can load any amount of LoRAs without needing separate nodes
@@ -380,6 +447,7 @@ class NmkdControlNet:
             },
             "optional": {
                 "model": ("MODEL",),
+                "send_preview": (["disable", "enable"], ),
             },
         }
 
@@ -388,35 +456,40 @@ class NmkdControlNet:
 
     CATEGORY = "Nmkd/Loaders"
 
-    def apply_controlnet(self, controlnet_path, conditioning, image, strength, model = None):
+    def apply_controlnet(self, controlnet_path, conditioning, image, strength, model = None, send_preview = "disable"):
         if not controlnet_path:
             print("NmkdControlNet: No model specified, skipping node.")
             return (conditioning,)
 
         if strength == 0:
             return (conditioning, )
-
-        img = 255. * image[0].cpu().numpy()
-        img = Image.fromarray(np.clip(img, 0, 255).astype(np.uint8))
-        buffer = BytesIO()
-        img.save(buffer, format="WEBP", subsampling=2, quality=5)
-        print(f"PREVIEW_WEBP:{base64.b64encode(buffer.getvalue())}")
-
-        control_net = comfy.sd.load_controlnet(controlnet_path) if model is None else comfy.sd.load_controlnet(controlnet_path, model)
-
-        c = []
-        control_hint = image.movedim(-1,1)
-        for t in conditioning:
-            n = [t[0], t[1].copy()]
-            c_net = control_net.copy().set_cond_hint(control_hint, strength)
-            if 'control' in t[1]:
-                c_net.set_previous_controlnet(t[1]['control'])
-            n[1]['control'] = c_net
-            n[1]['control_apply_to_uncond'] = True
-            c.append(n)
-        print(f"NmkdControlNet: Applied '{controlnet_path}' ({strength})")
-        return (c, )
-
+        
+        try:
+            if send_preview == "enable":
+                img = 255. * image[0].cpu().numpy()
+                img = Image.fromarray(np.clip(img, 0, 255).astype(np.uint8))
+                buffer = BytesIO()
+                img.save(buffer, format="WEBP", subsampling=2, quality=5)
+                print(f"PREVIEW_WEBP:{base64.b64encode(buffer.getvalue())}")
+            
+            control_net = comfy.controlnet.load_controlnet(controlnet_path) if model is None else comfy.controlnet.load_controlnet(controlnet_path, model)
+            
+            c = []
+            control_hint = image.movedim(-1,1)
+            for t in conditioning:
+                n = [t[0], t[1].copy()]
+                c_net = control_net.copy().set_cond_hint(control_hint, strength)
+                if 'control' in t[1]:
+                    c_net.set_previous_controlnet(t[1]['control'])
+                n[1]['control'] = c_net
+                n[1]['control_apply_to_uncond'] = True
+                c.append(n)
+            print(f"NmkdControlNet: Applied '{controlnet_path}' ({strength})")
+            return (c, )
+        except Exception as e:
+            print(f"NmkdControlNet: Failed to apply '{controlnet_path}', returning original conditioning.")
+            print(e)
+            return (conditioning, )
 
 # Hypernetwork Loader that can take absolute paths
 class NmkdHypernetworkLoader:
@@ -484,6 +557,61 @@ class NmkdDualTextEncode:
         return ([[cond1, {"pooled_output": pooled1}]], [[cond2, {"pooled_output": pooled2}]])
 
 
+# Save Image with logging
+class NmkdSaveImage:
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+        self.type = "output"
+        self.prefix_append = ""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "images": ("IMAGE", ),
+                    "filename_prefix": ("STRING", {"default": "ComfyUI"})
+                },
+                "optional": {
+                    "override_save_path": "STRING"
+                },
+                "hidden": {
+                    "prompt": "PROMPT",
+                    "extra_pnginfo": "EXTRA_PNGINFO"
+                }}
+
+    RETURN_TYPES = ()
+    FUNCTION = "save_images"
+
+    OUTPUT_NODE = True
+
+    CATEGORY = "Nmkd/Images"
+
+    def save_images(self, images, filename_prefix="ComfyUI", override_save_path=None, prompt=None, extra_pnginfo=None):
+        filename_prefix += self.prefix_append
+        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
+        for image in images:
+            i = 255. * image.cpu().numpy()
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+            metadata = PngInfo()
+            if prompt is not None:
+                metadata.add_text("prompt", json.dumps(prompt))
+            if extra_pnginfo is not None:
+                for x in extra_pnginfo:
+                    metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+
+            file = f"{filename}{counter:05}.png"
+            
+            if not override_save_path:
+                abs_path = os.path.join(full_output_folder, file)
+                img.save(abs_path, pnginfo=metadata, compress_level=4)
+                print(f"Saved image {counter} with prefix '{filename_prefix}' to: {abs_path}")
+            else:
+                img.save(override_save_path, pnginfo=metadata, compress_level=4)
+                print(f"Saved image {counter} with prefix '{filename_prefix}' to override path: {override_save_path}")
+            counter += 1
+
+        return ""
+
+
 # Register nodes
 
 NODE_CLASS_MAPPINGS = {
@@ -492,8 +620,10 @@ NODE_CLASS_MAPPINGS = {
     "NmkdStringConstant": NmkdStringConstant,
     "NmkdCheckpointLoader": NmkdCheckpointLoader,
     "NmkdKSampler": NmkdKSampler,
+    "NmkdHybridSampler": NmkdHybridSampler,
     "NmkdImageLoader": NmkdImageLoader,
     "NmkdImageUpscale": NmkdImageUpscale,
+    "NmkdUpscaleModelLoader": NmkdUpscaleModelLoader,
     "NmkdMultiLoraLoader": NmkdMultiLoraLoader,
     "NmkdVaeEncode": NmkdVaeEncode,
     "NmkdImageMaskComposite": NmkdImageMaskComposite,
@@ -501,6 +631,7 @@ NODE_CLASS_MAPPINGS = {
     "NmkdHypernetworkLoader": NmkdHypernetworkLoader,
     "NmkdColorPreprocessor": NmkdColorPreprocessor,
     "NmkdDualTextEncode": NmkdDualTextEncode,
+    "NmkdSaveImage": NmkdSaveImage,
 }
 
 def tensor_to_image(tensor):
