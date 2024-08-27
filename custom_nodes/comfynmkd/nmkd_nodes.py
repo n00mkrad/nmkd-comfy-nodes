@@ -15,9 +15,9 @@ import base64
 from io import BytesIO
 import os
 from comfy_extras.nodes_hypernetwork import load_hypernetwork_patch
-from .Fooocus import core
-from .Fooocus import patch
 from PIL.PngImagePlugin import PngInfo
+from spandrel import ModelLoader, ImageModelDescriptor
+import node_helpers # For FluxGuidance
 
 
 # Int Constant
@@ -97,14 +97,21 @@ class NmkdCheckpointLoader:
     CATEGORY = "Nmkd/Loaders"
 
     def load_checkpoint(self, mdl_path, load_vae, vae_path, embeddings_dir, clip_skip):
+        mdl_path = mdl_path.strip().strip('"')
         print(f"Loading checkpoint: {mdl_path}")
         enable_vae = load_vae == "enable"
         external_vae = enable_vae and vae_path and vae_path is not mdl_path # Only load VAE separately if it has a value and is not identical to the main model
+        if enable_vae:
+            print(f"Loading external VAE: {vae_path}" if external_vae else f"Loading VAE from model")
+        else:
+            print("VAE loading is disabled.")
         diffusers = os.path.isdir(mdl_path)
         if not embeddings_dir:
             embeddings_dir = folder_paths.get_folder_paths("embeddings")
         try:
+            print(f"Loading '{mdl_path}'")
             if(diffusers): # Assume path is Diffusers model
+                print(f"Loading as Diffusers (experimental)")
                 mdl = comfy.diffusers_load.load_diffusers(mdl_path, fp16=comfy.model_management.should_use_fp16(), output_vae=(enable_vae and not external_vae), output_clip=True, embedding_directory=embeddings_dir)
             else:
                 mdl = comfy.sd.load_checkpoint_guess_config(mdl_path, output_vae=(enable_vae and not external_vae), output_clip=True, embedding_directory=embeddings_dir)
@@ -118,7 +125,7 @@ class NmkdCheckpointLoader:
                 clip = clip.clone()
                 clip.clip_layer(clip_skip)
                 print(f"Applied CLIP skip: Stop at layer {clip_skip}")
-            return mdl
+            return mdl[:3]
         except:
             print(f"Failed to load model: {os.path.basename(mdl_path)}")
             return None
@@ -162,7 +169,7 @@ class NmkdKSampler:
         return nodes.common_ksampler(model, noise_seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise=denoise, disable_noise=disable_noise, start_step=start_at_step, last_step=end_at_step, force_full_denoise=force_full_denoise)
 
 
-# Sampler with Refiner
+# Sampler with Refiner (EXPERIMENTAL; MAY BE DITCHED)
 class NmkdHybridSampler:
     @classmethod
     def INPUT_TYPES(s):
@@ -218,7 +225,7 @@ class NmkdImageLoader:
     CATEGORY = "Nmkd/Loaders"
 
     def load_image(self, image_path):
-        i = Image.open(image_path)
+        i = Image.open(image_path.strip('"'))
         i = ImageOps.exif_transpose(i)
         image = i.convert("RGB")
         image = np.array(image).astype(np.float32) / 255.0
@@ -231,7 +238,7 @@ class NmkdImageLoader:
         return (image, mask)
 
 
-# ESRGAN Image Upscaler, accepts absolute model path, is skipped if no model is provided
+# ESRGAN (and similar) Image Upscaler, accepts absolute model path, is skipped if no model is provided
 class NmkdImageUpscale:
     @classmethod
     def INPUT_TYPES(s):
@@ -250,16 +257,26 @@ class NmkdImageUpscale:
         
         try:
             sd = comfy.utils.load_torch_file(model_path, safe_load=True)
-            out = model_loading.load_state_dict(sd).eval()
-            upscale_model = out
+            if "module.layers.0.residual_group.blocks.0.norm1.weight" in sd:
+                sd = comfy.utils.state_dict_prefix_replace(sd, {"module.":""})
+            upscale_model = ModelLoader().load_from_state_dict(sd).eval()
+
+            if not isinstance(upscale_model, ImageModelDescriptor):
+                raise Exception("Upscale model must be a single-image model.")
+
             device = model_management.get_torch_device()
+
+            memory_required = model_management.module_size(upscale_model.model)
+            memory_required += (512 * 512 * 3) * image.element_size() * max(upscale_model.scale, 1.0) * 384.0 # The 384.0 is an estimate of how much some of these models take, TODO: make it more accurate
+            memory_required += image.nelement() * image.element_size()
+            model_management.free_memory(memory_required, device)
+
             upscale_model.to(device)
             in_img = image.movedim(-1,-3).to(device)
-            free_memory = model_management.get_free_memory(device)
-    
-            tile = 1024
+
+            tile = 512
             overlap = 32
-    
+
             oom = True
             while oom:
                 try:
@@ -271,8 +288,8 @@ class NmkdImageUpscale:
                     tile //= 2
                     if tile < 128:
                         raise e
-    
-            upscale_model.cpu()
+
+            upscale_model.to("cpu")
             s = torch.clamp(s.movedim(-3,-1), min=0, max=1.0)
             return (s,)
         except:
@@ -368,9 +385,21 @@ class NmkdVaeEncode:
 
     CATEGORY = "latent/inpaint"
 
+    @staticmethod
+    def vae_encode_crop_pixels(pixels):
+        x = (pixels.shape[1] // 8) * 8
+        y = (pixels.shape[2] // 8) * 8
+        if pixels.shape[1] != x or pixels.shape[2] != y:
+            x_offset = (pixels.shape[1] % 8) // 2
+            y_offset = (pixels.shape[2] % 8) // 2
+            pixels = pixels[:, x_offset:x + x_offset, y_offset:y + y_offset, :]
+        return pixels
+
     def encode(self, vae, pixels, mask = None, grow_mask_by=6):    
         if mask is None:
-            mask = torch.zeros(pixels.shape[1], pixels.shape[2])
+            pixels = self.vae_encode_crop_pixels(pixels)
+            t = vae.encode(pixels[:,:,:,:3])
+            return ({"samples":t}, )
                     
         x = (pixels.shape[1] // 8) * 8
         y = (pixels.shape[2] // 8) * 8
@@ -392,9 +421,7 @@ class NmkdVaeEncode:
 
             mask_erosion = torch.clamp(torch.nn.functional.conv2d(mask.round(), kernel_tensor, padding=padding), 0, 1)
 
-        print(f"{mask.shape}")
         m = (1.0 - mask.round()).squeeze(1)
-        print(f"{m.shape}")
         for i in range(3):
             pixels[:,:,:,i] -= 0.5
             pixels[:,:,:,i] *= m
@@ -544,17 +571,53 @@ class NmkdDualTextEncode:
         return {"required": {
         "text1": ("STRING", {"multiline": False}),
         "text2": ("STRING", {"multiline": False}),
-        "clip": ("CLIP", )
+        "clip": ("CLIP", ),
+        "flux_guidance": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1}),
         }}
     RETURN_TYPES = ("CONDITIONING", "CONDITIONING",)
     FUNCTION = "encode"
 
     CATEGORY = "Nmkd/Conditioning"
 
-    def encode(self, clip, text1, text2):
+    def apply_flux_guidance(self, conditioning, guidance):
+        c = node_helpers.conditioning_set_values(conditioning, {"guidance": guidance})
+        return (c, )
+
+    def encode(self, clip, text1, text2, flux_guidance):
         cond1, pooled1 = clip.encode_from_tokens(clip.tokenize(text1), return_pooled=True)
         cond2, pooled2 = clip.encode_from_tokens(clip.tokenize(text2), return_pooled=True)
-        return ([[cond1, {"pooled_output": pooled1}]], [[cond2, {"pooled_output": pooled2}]])
+        outCond1 = [[cond1, {"pooled_output": pooled1}]]
+        outCond2 = [[cond2, {"pooled_output": pooled2}]]
+        if text1 and flux_guidance > 0:
+            outCond1 = node_helpers.conditioning_set_values(outCond1, {"guidance": flux_guidance})
+        if text2 and flux_guidance > 0:
+            outCond2 = node_helpers.conditioning_set_values(outCond2, {"guidance": flux_guidance})
+        return (outCond1, outCond2)
+
+
+# Single node for regular or SD3 latent image
+class NmkdLatentImage:
+    def __init__(self):
+        self.device = comfy.model_management.intermediate_device()
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "width": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16}),
+            "height": ("INT", {"default": 1024, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16}),
+            "sd3": (["disable", "enable"], ),
+        }}
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "generate"
+
+    def generate(self, width, height, sd3):
+        batch_size = 1
+        if sd3:
+            latent = torch.ones([batch_size, 16, height // 8, width // 8], device=self.device) * 0.0609
+        else:
+            latent = torch.zeros([batch_size, 4, height // 8, width // 8], device=self.device)
+        return ({"samples":latent}, )
 
 
 # Save Image with logging
@@ -620,7 +683,6 @@ NODE_CLASS_MAPPINGS = {
     "NmkdStringConstant": NmkdStringConstant,
     "NmkdCheckpointLoader": NmkdCheckpointLoader,
     "NmkdKSampler": NmkdKSampler,
-    "NmkdHybridSampler": NmkdHybridSampler,
     "NmkdImageLoader": NmkdImageLoader,
     "NmkdImageUpscale": NmkdImageUpscale,
     "NmkdUpscaleModelLoader": NmkdUpscaleModelLoader,
@@ -632,6 +694,7 @@ NODE_CLASS_MAPPINGS = {
     "NmkdColorPreprocessor": NmkdColorPreprocessor,
     "NmkdDualTextEncode": NmkdDualTextEncode,
     "NmkdSaveImage": NmkdSaveImage,
+    "NmkdLatentImage": NmkdLatentImage,
 }
 
 def tensor_to_image(tensor):
